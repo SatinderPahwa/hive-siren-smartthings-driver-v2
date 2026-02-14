@@ -1,0 +1,23 @@
+zigbeeManufacturer:
+  # Entry for your specific device based on hub discovery
+  - id: "hive-siren-LDS"
+    deviceLabel: "Hive Siren"
+    manufacturer: "LDS"
+    model: "SIREN001"
+    deviceProfileName: "hive-siren"
+  # Original Hive/Centrica Connected Home entries
+  - id: "hive-siren-v1"
+    deviceLabel: "Hive Siren"
+    manufacturer: "Computime"
+    model: "SIREN001"
+    deviceProfileName: "hive-siren"
+  - id: "hive-siren-v2"
+    deviceLabel: "Hive Siren"
+    manufacturer: "Centrica Connected Home"
+    model: "SIREN001"
+    deviceProfileName: "hive-siren"
+  - id: "hive-siren-generic"
+    deviceLabel: "Hive Siren"
+    manufacturer: "AlertMe.com"
+    model: "SIREN001"
+    deviceProfileName: "hive-siren"

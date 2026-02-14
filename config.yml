@@ -1,0 +1,4 @@
+name: "Hive Siren"
+packageKey: "hive-siren"
+permissions:
+  zigbee: {}

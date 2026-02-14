@@ -1,0 +1,30 @@
+name: hive-siren
+components:
+  # Component for the primary siren functionality on Endpoint 0x01
+  - id: main
+    capabilities:
+      - id: switch
+        version: 1
+      - id: alarm
+        version: 1
+      - id: battery
+        version: 1
+      - id: refresh
+        version: 1
+    categories:
+      - name: Siren
+  # Component for the floodlight functionality on Endpoint 0x02
+  - id: light
+    capabilities:
+      - id: switch
+        version: 1
+      - id: switchLevel
+        version: 1
+      - id: refresh
+        version: 1
+    categories:
+      - name: Light
+metadata:
+  deviceType: Siren
+  ocfDeviceType: x.com.st.d.siren
+  deviceTypeId: Siren
