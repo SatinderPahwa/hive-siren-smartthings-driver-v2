@@ -1,8 +1,9 @@
-name: hive-siren
+name: hive-siren-alarm
 components:
-  # Parent device - minimal profile, children provide full functionality
   - id: main
     capabilities:
+      - id: alarm
+        version: 1
       - id: battery
         version: 1
       - id: refresh

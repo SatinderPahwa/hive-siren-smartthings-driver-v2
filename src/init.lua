@@ -36,12 +36,61 @@ local SIREN_LEVEL_VERY_HIGH = 3
 local DEFAULT_WARNING_DURATION = 60
 
 ---
+-- CHILD DEVICE ROUTING
+-- These must be declared BEFORE the capability handlers that use them
+---
+
+-- Find child device by endpoint
+local function find_child_by_endpoint(parent, endpoint)
+  if endpoint == SIREN_ENDPOINT then
+    return parent:get_child_by_parent_assigned_key("alarm_ep01")
+  elseif endpoint == LIGHT_ENDPOINT then
+    return parent:get_child_by_parent_assigned_key("light_ep02")
+  end
+  return nil
+end
+
+-- Get endpoint from device (works for parent and child)
+local function get_device_endpoint(device)
+  if device.parent_device_id then
+    -- This is a child device
+    local child_key = device:get_parent_assigned_child_key()
+    if child_key == "alarm_ep01" then
+      return SIREN_ENDPOINT
+    elseif child_key == "light_ep02" then
+      return LIGHT_ENDPOINT
+    end
+  end
+  return nil
+end
+
+-- Returns true if device is an EDGE_CHILD (virtual child), false for physical Zigbee device.
+-- Physical Zigbee devices have parent = hub (not managed by this driver, so get_device_info returns nil).
+-- EDGE_CHILD devices have parent = the physical siren (managed by this driver, returns non-nil).
+local function is_edge_child(driver, device)
+  if device.parent_device_id == nil then return false end
+  local parent = driver:get_device_info(device.parent_device_id)
+  return parent ~= nil
+end
+
+-- Get parent device (returns self if already parent)
+local function get_parent_device(driver, device)
+  if is_edge_child(driver, device) then
+    return driver:get_device_info(device.parent_device_id)
+  end
+  return device
+end
+
+---
 -- CAPABILITY HANDLERS
 ---
 
 local function handle_alarm(driver, device, command)
   log.info(string.format("ALARM HANDLER: Received command: %s", command.command))
-  
+
+  -- Get parent device to send Zigbee commands
+  local parent = get_parent_device(driver, device)
+
   local warning_mode = WARNING_MODE_BURGLAR
   local strobe = STROBE_NO
   local siren_level = SIREN_LEVEL_HIGH
@@ -52,127 +101,110 @@ local function handle_alarm(driver, device, command)
     siren_level = SIREN_LEVEL_LOW
     duration = 0
     strobe = STROBE_NO
-    
-    -- Also turn off flood light when stopping alarm
-    device:send(OnOff.server.commands.Off(device):to_endpoint(LIGHT_ENDPOINT))
+
+    -- Turn off both siren and light
+    parent:send(OnOff.server.commands.Off(parent):to_endpoint(LIGHT_ENDPOINT))
+
   elseif command.command == "siren" then
-    -- Siren only - EMERGENCY with strobe YES produces full siren (tested working)
-    warning_mode = WARNING_MODE_EMERGENCY
-    strobe = STROBE_YES
-    siren_level = SIREN_LEVEL_LOW
-  elseif command.command == "strobe" then
-    -- Strobe only - EMERGENCY with no strobe produces beep (visual/entry alert)
+    -- Audio only - emergency mode with no strobe
     warning_mode = WARNING_MODE_EMERGENCY
     strobe = STROBE_NO
     siren_level = SIREN_LEVEL_HIGH
+
+  elseif command.command == "strobe" then
+    -- FIX: Both visual AND audio (strobe + siren)
+    warning_mode = WARNING_MODE_EMERGENCY
+    strobe = STROBE_YES  -- FIXED: Was STROBE_NO
+    siren_level = SIREN_LEVEL_LOW
+
+    -- Also activate the light endpoint for visual effect
+    parent:send(OnOff.server.commands.On(parent):to_endpoint(LIGHT_ENDPOINT))
+
   elseif command.command == "both" then
-    -- Both siren and strobe - Try different strobe parameters
+    -- Full alarm - both siren and strobe
     warning_mode = WARNING_MODE_EMERGENCY
     strobe = STROBE_YES
-    siren_level = SIREN_LEVEL_LOW
+    siren_level = SIREN_LEVEL_HIGH
+
+    -- Turn on the flood light for additional visual effect
+    parent:send(OnOff.server.commands.On(parent):to_endpoint(LIGHT_ENDPOINT))
   end
 
-  -- For both mode, try reading the LED config first, then set both siren and light
-  if command.command == "both" then
-    log.info("Both mode: trying siren + manual light control")
-    
-    -- First turn on the flood light for visual effect
-    device:send(OnOff.server.commands.On(device):to_endpoint(LIGHT_ENDPOINT))
-    
-    -- Then send siren command (will use current warning_mode/siren_level settings)
-    -- This keeps the audio part working
-  end
-  
-  -- Build IASWD command parameters according to PRD specifications
+  -- Build IASWD command parameters
   local warning_info = (warning_mode & 0x0F) | ((strobe & 0x03) << 4) | ((siren_level & 0x03) << 6)
-  
-  -- For both mode, try different strobe parameters
+
+  -- Set strobe parameters based on command
+  local strobe_duty_cycle = (strobe == STROBE_YES) and 50 or 0
+  local strobe_level = (strobe == STROBE_YES) and SIREN_LEVEL_HIGH or 0
+
+  -- For "both" mode, use maximum strobe effect
   if command.command == "both" then
-    -- Try maximum strobe duty cycle and different level
-    strobe_duty_cycle = 100  -- Max duty cycle
-    strobe_level = SIREN_LEVEL_VERY_HIGH  -- Max strobe level
-    log.info("Both mode: using max strobe duty=100, level=VERY_HIGH")
-  else
-    strobe_duty_cycle = (strobe == STROBE_YES) and 50 or 0
-    strobe_level = (strobe == STROBE_YES) and SIREN_LEVEL_HIGH or 0
+    strobe_duty_cycle = 100
+    strobe_level = SIREN_LEVEL_VERY_HIGH
+  elseif command.command == "strobe" then
+    -- For strobe mode, use strong visual effect
+    strobe_duty_cycle = 75
+    strobe_level = SIREN_LEVEL_VERY_HIGH
   end
-  
-  log.info(string.format("PRD-Compliant StartWarning: mode=0x%02X, duration=%d, strobe_duty=%d, strobe_level=%d", 
+
+  log.info(string.format("StartWarning: mode=0x%02X, duration=%d, strobe_duty=%d, strobe_level=%d",
     warning_info, duration, strobe_duty_cycle, strobe_level))
-  
-  -- Send command to siren endpoint
-  device:send(IASWD.server.commands.StartWarning(device, warning_info, duration, strobe_duty_cycle, strobe_level):to_endpoint(SIREN_ENDPOINT))
-  
-  -- For both mode, also turn on flood light for visual effect
-  if command.command == "both" then
-    device.thread:call_with_delay(0.2, function()
-      device:send(OnOff.server.commands.On(device):to_endpoint(LIGHT_ENDPOINT))
-      log.info("Flood light turned on for both mode")
-    end)
-  end
-  
-  -- Log command sent (removed sounder state read as attribute doesn't exist)
-  log.info("StartWarning command sent to device")
-  
+
+  -- Send command to siren endpoint via parent
+  parent:send(IASWD.server.commands.StartWarning(parent, warning_info, duration, strobe_duty_cycle, strobe_level):to_endpoint(SIREN_ENDPOINT))
+
+  -- Emit event to the alarm child device (or main if called on parent)
   device:emit_component_event(
-    device.profile.components.main, 
+    device.profile.components.main,
     capabilities.alarm.alarm(command.command)
   )
 end
 
 local function handle_switch(driver, device, command)
-  log.info(string.format("SWITCH HANDLER: Received command: %s for component: %s", 
-    command.command, command.component))
-  
-  -- Main component switch controls the light for easy access
-  local is_main = (command.component == "main")
-  
-  local zigbee_command = (command.command == "on") and 
-    OnOff.server.commands.On(device) or OnOff.server.commands.Off(device)
-  
-  -- Always send to light endpoint
-  device:send(zigbee_command:to_endpoint(LIGHT_ENDPOINT))
-  
-  -- Schedule a read to verify the command was received
+  log.info(string.format("SWITCH HANDLER: Received command: %s", command.command))
+
+  -- Get parent device to send Zigbee commands
+  local parent = get_parent_device(driver, device)
+
+  local zigbee_command = (command.command == "on") and
+    OnOff.server.commands.On(parent) or OnOff.server.commands.Off(parent)
+
+  -- Send to light endpoint
+  parent:send(zigbee_command:to_endpoint(LIGHT_ENDPOINT))
+
+  -- Schedule a read to verify
   device.thread:call_with_delay(1, function()
-    device:send(OnOff.attributes.OnOff:read(device):to_endpoint(LIGHT_ENDPOINT))
+    parent:send(OnOff.attributes.OnOff:read(parent):to_endpoint(LIGHT_ENDPOINT))
   end)
-  
-  -- Emit events for both main and light components if main was triggered
-  if is_main then
-    device:emit_component_event(
-      device.profile.components.main, 
-      capabilities.switch.switch(command.command)
-    )
-  end
-  
-  -- Always update light component
+
+  -- Emit event to the calling device (light child)
   device:emit_component_event(
-    device.profile.components.light, 
+    device.profile.components.main,
     capabilities.switch.switch(command.command)
   )
 end
 
 local function handle_level(driver, device, command)
   local level = command.args.level
-  log.info(string.format("LEVEL HANDLER: Set level to %d%% for component: %s", 
-    level, command.component))
-  
-  -- Convert percentage (0-100) to Zigbee level (0-254)
+  log.info(string.format("LEVEL HANDLER: Set level to %d%%", level))
+
+  -- Get parent device to send Zigbee commands
+  local parent = get_parent_device(driver, device)
+
+  -- Convert percentage to Zigbee level
   local zigbee_level = math.floor(level * 2.54)
-  
-  -- Send level command with transition time of 1 second
-  device:send(Level.server.commands.MoveToLevelWithOnOff(device, zigbee_level, 10):to_endpoint(LIGHT_ENDPOINT))
-  
-  -- Schedule a read to verify the command was received
+
+  -- Send level command
+  parent:send(Level.server.commands.MoveToLevelWithOnOff(parent, zigbee_level, 10):to_endpoint(LIGHT_ENDPOINT))
+
+  -- Schedule a read to verify
   device.thread:call_with_delay(2, function()
-    device:send(Level.attributes.CurrentLevel:read(device):to_endpoint(LIGHT_ENDPOINT))
+    parent:send(Level.attributes.CurrentLevel:read(parent):to_endpoint(LIGHT_ENDPOINT))
   end)
-  
-  -- Emit event for the correct component
-  local component = command.component and device.profile.components[command.component] or device.profile.components.light
+
+  -- Emit event to the calling device (light child)
   device:emit_component_event(
-    component, 
+    device.profile.components.main,
     capabilities.switchLevel.level(level)
   )
 end
@@ -183,24 +215,102 @@ end
 
 local function device_added(driver, device)
   log.info("Hive Siren added: " .. device.id)
-  
-  -- Initialize device state for both components
-  device:emit_component_event(device.profile.components.main, capabilities.switch.switch("off"))
-  device:emit_component_event(device.profile.components.main, capabilities.alarm.alarm("off"))
-  device:emit_component_event(device.profile.components.main, capabilities.battery.battery(100))
-  
-  if device.profile.components.light then
-    device:emit_component_event(device.profile.components.light, capabilities.switch.switch("off"))
-    device:emit_component_event(device.profile.components.light, capabilities.switchLevel.level(100))
+
+  -- Only create children if this is the physical Zigbee device (not an EDGE_CHILD)
+  if not is_edge_child(driver, device) then
+    log.info("Creating child devices for parent: " .. device.id)
+    create_child_devices_if_needed(driver, device)
+
+    -- Initialize parent device state (minimal)
+    device:emit_component_event(device.profile.components.main, capabilities.battery.battery(100))
+  else
+    -- This is an EDGE_CHILD device being added.
+    -- Guard: if parent is also an EDGE_CHILD, this is a cascade device — delete it.
+    local parent = driver:get_device_info(device.parent_device_id)
+    if parent and is_edge_child(driver, parent) then
+      log.error("Cascade child detected in added, deleting: " .. device.id)
+      device:delete()
+      return
+    end
+
+    local child_key = device.parent_assigned_child_key
+    log.info("Child device added with key: " .. tostring(child_key))
+
+    if child_key == "alarm_ep01" then
+      -- Initialize alarm child
+      device:emit_component_event(device.profile.components.main, capabilities.alarm.alarm("off"))
+      device:emit_component_event(device.profile.components.main, capabilities.battery.battery(100))
+    elseif child_key == "light_ep02" then
+      -- Initialize light child
+      device:emit_component_event(device.profile.components.main, capabilities.switch.switch("off"))
+      device:emit_component_event(device.profile.components.main, capabilities.switchLevel.level(100))
+    end
   end
-  
-  -- Read basic device info
-  device:send(Basic.attributes.ManufacturerName:read(device):to_endpoint(SIREN_ENDPOINT))
-  device:send(Basic.attributes.ModelIdentifier:read(device):to_endpoint(SIREN_ENDPOINT))
+
+  -- Read basic device info (only for physical Zigbee device)
+  if not is_edge_child(driver, device) then
+    device:send(Basic.attributes.ManufacturerName:read(device):to_endpoint(SIREN_ENDPOINT))
+    device:send(Basic.attributes.ModelIdentifier:read(device):to_endpoint(SIREN_ENDPOINT))
+  end
+end
+
+local function create_child_devices_if_needed(driver, device)
+  -- Check if children already exist (idempotent - safe to call multiple times)
+  local alarm_child = device:get_child_by_parent_assigned_key("alarm_ep01")
+  local light_child = device:get_child_by_parent_assigned_key("light_ep02")
+
+  if alarm_child == nil then
+    log.info("Creating alarm child device for: " .. device.id)
+    driver:try_create_device({
+      type = "EDGE_CHILD",
+      parent_device_id = device.id,
+      parent_assigned_child_key = "alarm_ep01",
+      label = device.label .. " - Alarm",
+      profile = "hive-siren-alarm",
+      manufacturer = "Hive",
+      model = "SIREN001-Alarm",
+      vendor_provided_label = "Hive Siren Alarm"
+    })
+  else
+    log.info("Alarm child already exists, skipping creation")
+  end
+
+  if light_child == nil then
+    log.info("Creating light child device for: " .. device.id)
+    driver:try_create_device({
+      type = "EDGE_CHILD",
+      parent_device_id = device.id,
+      parent_assigned_child_key = "light_ep02",
+      label = device.label .. " - Light",
+      profile = "hive-siren-light",
+      manufacturer = "Hive",
+      model = "SIREN001-Light",
+      vendor_provided_label = "Hive Siren Light"
+    })
+  else
+    log.info("Light child already exists, skipping creation")
+  end
 end
 
 local function device_init(driver, device)
+  -- Handle EDGE_CHILD devices
+  if is_edge_child(driver, device) then
+    -- Check if this is a cascade child (child of a child) — delete it
+    local parent = driver:get_device_info(device.parent_device_id)
+    if parent and is_edge_child(driver, parent) then
+      log.error("Cascade child detected in init, deleting: " .. device.id)
+      device:delete()
+      return
+    end
+    log.info("Child device initialized: " .. device.id .. " (skipping Zigbee init)")
+    return
+  end
+
   log.info("Hive Siren initialized: " .. device.id)
+
+  -- Create child devices if they don't exist yet.
+  -- This handles driver-switch assignments where device_added is NOT called.
+  create_child_devices_if_needed(driver, device)
   
   -- Perform IAS Zone enrollment sequence
   log.info("Starting IAS Zone enrollment")
@@ -259,6 +369,12 @@ local function device_init(driver, device)
 end
 
 local function do_configure(driver, device)
+  -- Skip Zigbee configuration for EDGE_CHILD devices
+  if is_edge_child(driver, device) then
+    log.info("Child device configure: " .. device.id .. " (skipping Zigbee config)")
+    return
+  end
+
   log.info("Configuring Hive Siren: " .. device.id)
   
   -- Configure cluster reporting per PRD specifications
@@ -271,6 +387,10 @@ local function do_configure(driver, device)
   device:send(OnOff.attributes.OnOff:read(device):to_endpoint(LIGHT_ENDPOINT))
   device:send(Level.attributes.CurrentLevel:read(device):to_endpoint(LIGHT_ENDPOINT))
 end
+
+---
+-- ZIGBEE EVENT HANDLERS
+---
 
 -- IAS Zone enrollment request handler
 local function ias_zone_enroll_request_handler(driver, device, zone_type, manufacturer)
@@ -285,27 +405,41 @@ end
 -- IAS Zone status change handler
 local function ias_zone_status_change_handler(driver, device, zone_status)
   log.info(string.format("IAS Zone status change: 0x%04X", zone_status.value))
-  
-  -- Update device status based on zone status bits
+
   local is_alarm1 = (zone_status.value & 0x0001) ~= 0
   local is_alarm2 = (zone_status.value & 0x0002) ~= 0
   local is_tamper = (zone_status.value & 0x0004) ~= 0
   local is_battery_low = (zone_status.value & 0x0008) ~= 0
-  
+
   if is_battery_low then
-    device:emit_component_event(device.profile.components.main, 
-      capabilities.battery.battery(10))  -- Low battery warning
+    -- Route to alarm child device
+    local alarm_child = device:get_child_by_parent_assigned_key("alarm_ep01")
+    if alarm_child then
+      alarm_child:emit_component_event(alarm_child.profile.components.main,
+        capabilities.battery.battery(10))
+    else
+      device:emit_component_event(device.profile.components.main,
+        capabilities.battery.battery(10))
+    end
   end
 end
 
 -- Battery reporting handler
 local function battery_percent_handler(driver, device, value)
   if value and value.value then
-    -- Clamp battery percentage to valid range (0-100)
     local battery_percent = math.max(0, math.min(100, value.value))
-    log.info(string.format("Battery level: %d%% (raw: %d)", battery_percent, value.value))
-    device:emit_component_event(device.profile.components.main, 
-      capabilities.battery.battery(battery_percent))
+    log.info(string.format("Battery level: %d%%", battery_percent))
+
+    -- Route to alarm child device only
+    local alarm_child = device:get_child_by_parent_assigned_key("alarm_ep01")
+    if alarm_child then
+      alarm_child:emit_component_event(alarm_child.profile.components.main,
+        capabilities.battery.battery(battery_percent))
+    else
+      -- Fallback to parent if child not found
+      device:emit_component_event(device.profile.components.main,
+        capabilities.battery.battery(battery_percent))
+    end
   end
 end
 
@@ -314,16 +448,17 @@ local function onoff_attr_handler(driver, device, value, zb_rx)
   if zb_rx.address_header.src_endpoint.value == LIGHT_ENDPOINT then
     log.info(string.format("Light OnOff state: %s", value.value and "on" or "off"))
     local state = value.value and "on" or "off"
-    
-    -- Update both main and light components
-    device:emit_component_event(
-      device.profile.components.main,
-      capabilities.switch.switch(state)
-    )
-    device:emit_component_event(
-      device.profile.components.light,
-      capabilities.switch.switch(state)
-    )
+
+    -- Route to light child device
+    local light_child = device:get_child_by_parent_assigned_key("light_ep02")
+    if light_child then
+      light_child:emit_component_event(light_child.profile.components.main,
+        capabilities.switch.switch(state))
+    else
+      -- Fallback to parent if child not found
+      device:emit_component_event(device.profile.components.main,
+        capabilities.switch.switch(state))
+    end
   end
 end
 
@@ -332,10 +467,17 @@ local function level_attr_handler(driver, device, value, zb_rx)
   if zb_rx.address_header.src_endpoint.value == LIGHT_ENDPOINT then
     local level_percent = math.floor(value.value / 2.54)
     log.info(string.format("Light level: %d%%", level_percent))
-    device:emit_component_event(
-      device.profile.components.light,
-      capabilities.switchLevel.level(level_percent)
-    )
+
+    -- Route to light child device
+    local light_child = device:get_child_by_parent_assigned_key("light_ep02")
+    if light_child then
+      light_child:emit_component_event(light_child.profile.components.main,
+        capabilities.switchLevel.level(level_percent))
+    else
+      -- Fallback to parent if child not found
+      device:emit_component_event(device.profile.components.main,
+        capabilities.switchLevel.level(level_percent))
+    end
   end
 end
 
@@ -394,9 +536,14 @@ local hive_siren_driver = {
     },
     [capabilities.refresh.ID] = {
       [capabilities.refresh.commands.refresh.NAME] = function(driver, device)
-        device:send(PowerConfiguration.attributes.BatteryPercentageRemaining:read(device):to_endpoint(SIREN_ENDPOINT))
-        device:send(OnOff.attributes.OnOff:read(device):to_endpoint(LIGHT_ENDPOINT))
-        device:send(Level.attributes.CurrentLevel:read(device):to_endpoint(LIGHT_ENDPOINT))
+        local parent = get_parent_device(driver, device)
+
+        -- Refresh battery (for alarm child)
+        parent:send(PowerConfiguration.attributes.BatteryPercentageRemaining:read(parent):to_endpoint(SIREN_ENDPOINT))
+
+        -- Refresh light state (for light child)
+        parent:send(OnOff.attributes.OnOff:read(parent):to_endpoint(LIGHT_ENDPOINT))
+        parent:send(Level.attributes.CurrentLevel:read(parent):to_endpoint(LIGHT_ENDPOINT))
       end
     }
   },
