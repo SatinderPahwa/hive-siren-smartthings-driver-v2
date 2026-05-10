@@ -112,19 +112,19 @@ local function handle_alarm(driver, device, command)
     siren_level = SIREN_LEVEL_HIGH
 
   elseif command.command == "strobe" then
-    -- FIX: Both visual AND audio (strobe + siren)
+    -- Loud siren: EMERGENCY + strobe=YES + level=LOW (confirmed working)
     warning_mode = WARNING_MODE_EMERGENCY
-    strobe = STROBE_YES  -- FIXED: Was STROBE_NO
+    strobe = STROBE_YES
     siren_level = SIREN_LEVEL_LOW
 
     -- Also activate the light endpoint for visual effect
     parent:send(OnOff.server.commands.On(parent):to_endpoint(LIGHT_ENDPOINT))
 
   elseif command.command == "both" then
-    -- Full alarm - uses strobe=NO + level=HIGH which produces loud siren on Hive hardware
+    -- Full alarm - strobe=YES + level=LOW produces loud siren on Hive hardware
     warning_mode = WARNING_MODE_EMERGENCY
-    strobe = STROBE_NO
-    siren_level = SIREN_LEVEL_HIGH
+    strobe = STROBE_YES
+    siren_level = SIREN_LEVEL_LOW
 
     -- Turn on the flood light for visual effect
     parent:send(OnOff.server.commands.On(parent):to_endpoint(LIGHT_ENDPOINT))
@@ -137,11 +137,10 @@ local function handle_alarm(driver, device, command)
   local strobe_duty_cycle = (strobe == STROBE_YES) and 50 or 0
   local strobe_level = (strobe == STROBE_YES) and SIREN_LEVEL_HIGH or 0
 
-  -- For "both" mode, no strobe needed (strobe=NO produces loud siren on Hive hardware)
-  -- Light endpoint is already turned on above for visual alert
+  -- For "both" mode, strobe=YES + level=LOW produces loud siren on Hive hardware
   if command.command == "both" then
-    strobe_duty_cycle = 0
-    strobe_level = 0
+    strobe_duty_cycle = 50
+    strobe_level = SIREN_LEVEL_HIGH
   elseif command.command == "strobe" then
     -- For strobe mode, use strong visual effect
     strobe_duty_cycle = 75
